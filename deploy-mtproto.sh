@@ -26,6 +26,8 @@ SETUP_NGINX="${SETUP_NGINX:-1}"
 SETUP_PM2="${SETUP_PM2:-1}"
 WEB_ROOT="/var/www/heliproxy"
 MONITOR_DIR="/opt/heliproxy"
+REPO_URL="https://github.com/HeliTop1337/Proxy.git"
+REPO_DIR="/opt/heliproxy-repo"
 
 usage() {
   cat <<'EOF'
@@ -81,6 +83,7 @@ ensure_base_tools() {
     DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
     apt_install_if_missing ca-certificates
     apt_install_if_missing curl
+    apt_install_if_missing git
     apt_install_if_missing iproute2
     apt_install_if_missing procps
     apt_install_if_missing dnsutils
@@ -484,6 +487,23 @@ Next steps:
 EOF
 }
 
+clone_repo() {
+  if [[ -d "${REPO_DIR}/.git" ]]; then
+    log "Updating repo from GitHub..."
+    git -C "${REPO_DIR}" pull --ff-only 2>&1 | while read -r line; do log "${line}"; done
+  else
+    log "Cloning repo from ${REPO_URL}..."
+    rm -rf "${REPO_DIR}"
+    git clone --depth 1 "${REPO_URL}" "${REPO_DIR}" 2>&1 | while read -r line; do log "${line}"; done
+  fi
+
+  if [[ ! -d "${REPO_DIR}" ]]; then
+    error "Failed to clone repo."
+    exit 1
+  fi
+  log "Repo ready at ${REPO_DIR}."
+}
+
 setup_web_landing() {
   mkdir -p "${WEB_ROOT}"
   cat > "${WEB_ROOT}/index.html" <<'HTMLEOF'
@@ -542,36 +562,11 @@ setup_nginx() {
   fi
 
   local nginx_conf="/etc/nginx/sites-available/heliproxy"
+  cp "${REPO_DIR}/nginx.conf" "${nginx_conf}"
 
-  cat > "${nginx_conf}" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${SERVER_HOST};
-
-    root ${WEB_ROOT};
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    location /health {
-        proxy_pass         http://127.0.0.1:3000/health;
-        proxy_http_version 1.1;
-        proxy_set_header   Host \$host;
-        proxy_connect_timeout 3s;
-        proxy_read_timeout    5s;
-    }
-
-    location /status {
-        stub_status on;
-        access_log  off;
-        allow       127.0.0.1;
-        deny        all;
-    }
-}
-EOF
+  # Patch server_name and root to match current settings
+  sed -i "s|server_name .*;|server_name ${SERVER_HOST};|g" "${nginx_conf}"
+  sed -i "s|root .*;|root ${WEB_ROOT};|g" "${nginx_conf}"
 
   ln -sf "${nginx_conf}" /etc/nginx/sites-enabled/heliproxy
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
@@ -606,112 +601,13 @@ setup_monitor() {
 
   mkdir -p "${MONITOR_DIR}"
 
-  cat > "${MONITOR_DIR}/monitor.js" <<JSEOF
-'use strict';
-const http = require('http');
-const { execSync } = require('child_process');
+  # Copy files from cloned repo
+  cp "${REPO_DIR}/monitor.js"          "${MONITOR_DIR}/monitor.js"
+  cp "${REPO_DIR}/ecosystem.config.js" "${MONITOR_DIR}/ecosystem.config.js"
 
-const CONTAINER = process.env.CONTAINER_NAME || 'mtproto-proxy';
-const PORT      = parseInt(process.env.MONITOR_PORT || '3000', 10);
-const INTERVAL  = parseInt(process.env.CHECK_INTERVAL_MS || '30000', 10);
-
-let lastCheck = { time: null, status: 'unknown', uptime: null };
-
-function isContainerRunning() {
-  try {
-    const out = execSync(
-      \`docker inspect -f '{{.State.Running}}' \${CONTAINER}\`,
-      { timeout: 8000, encoding: 'utf8' }
-    ).trim();
-    return out === 'true';
-  } catch (_) {
-    return false;
-  }
-}
-
-function restartContainer() {
-  try {
-    execSync(\`docker start \${CONTAINER}\`, { timeout: 15000 });
-    console.log(\`[\${new Date().toISOString()}] [RECOVER] Container \${CONTAINER} restarted.\`);
-  } catch (err) {
-    console.error(\`[\${new Date().toISOString()}] [ERROR] Failed to restart container: \${err.message}\`);
-  }
-}
-
-function containerUptime() {
-  try {
-    return execSync(
-      \`docker inspect -f '{{.State.StartedAt}}' \${CONTAINER}\`,
-      { timeout: 5000, encoding: 'utf8' }
-    ).trim();
-  } catch (_) {
-    return null;
-  }
-}
-
-function runCheck() {
-  const running = isContainerRunning();
-  lastCheck = {
-    time:   new Date().toISOString(),
-    status: running ? 'running' : 'down',
-    uptime: running ? containerUptime() : null,
-  };
-
-  if (!running) {
-    console.warn(\`[\${lastCheck.time}] [WARN] Container \${CONTAINER} is down — restarting...\`);
-    restartContainer();
-  } else {
-    console.log(\`[\${lastCheck.time}] [OK] Container \${CONTAINER} is running.\`);
-  }
-}
-
-const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    const ok = lastCheck.status === 'running';
-    res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ...lastCheck, container: CONTAINER }));
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
-});
-
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(\`[INFO] Health monitor listening on 127.0.0.1:\${PORT}\`);
-});
-
-runCheck();
-setInterval(runCheck, INTERVAL);
-JSEOF
-
-  cat > "${MONITOR_DIR}/ecosystem.config.js" <<ECOEOF
-'use strict';
-
-module.exports = {
-  apps: [
-    {
-      name:             'heliproxy-monitor',
-      script:           '${MONITOR_DIR}/monitor.js',
-      instances:        1,
-      autorestart:      true,
-      watch:            false,
-      max_restarts:     20,
-      restart_delay:    5000,
-      exp_backoff_restart_delay: 100,
-      max_memory_restart: '128M',
-      env: {
-        NODE_ENV:          'production',
-        CONTAINER_NAME:    '${CONTAINER_NAME}',
-        MONITOR_PORT:      '3000',
-        CHECK_INTERVAL_MS: '30000',
-      },
-      error_file:  '/var/log/heliproxy-monitor-err.log',
-      out_file:    '/var/log/heliproxy-monitor-out.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    },
-  ],
-};
-ECOEOF
+  # Patch container name into ecosystem config
+  sed -i "s|'mtproto-proxy'|'${CONTAINER_NAME}'|g" "${MONITOR_DIR}/ecosystem.config.js"
+  sed -i "s|/opt/heliproxy/monitor.js|${MONITOR_DIR}/monitor.js|g" "${MONITOR_DIR}/ecosystem.config.js"
 
   pm2 delete heliproxy-monitor 2>/dev/null || true
   pm2 start "${MONITOR_DIR}/ecosystem.config.js"
@@ -726,6 +622,7 @@ main() {
   parse_args "$@"
   ensure_base_tools
   install_docker_if_missing
+  clone_repo
   pull_mtg_image
   validate_mask_domain
   validate_server_host_mapping
