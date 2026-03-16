@@ -52,16 +52,56 @@ Example:
 EOF
 }
 
-log() {
-  printf '[INFO] %s\n' "$*"
+# ── Colors & UI ──────────────────────────────────────────────────────────────
+_R='\033[0;31m' _G='\033[0;32m' _Y='\033[0;33m'
+_B='\033[0;34m' _C='\033[0;36m' _W='\033[1;37m'
+_DIM='\033[2m'  _BOLD='\033[1m' _RST='\033[0m'
+
+_STEP=0
+_TOTAL=12
+
+log()  { printf "${_DIM}[${_C}INFO${_RST}${_DIM}]${_RST} %s\n" "$*"; }
+warn() { printf "${_DIM}[${_Y}WARN${_RST}${_DIM}]${_RST} %s\n" "$*"; }
+error(){ printf "${_DIM}[${_R}ERR ${_RST}${_DIM}]${_RST} %s\n" "$*" >&2; }
+
+step_start() {
+  (( _STEP++ )) || true
+  local pct=$(( _STEP * 100 / _TOTAL ))
+  local filled=$(( pct * 28 / 100 ))
+  local bar=""
+  local i=0
+  while (( i < filled ));    do bar+="█"; (( i++ )) || true; done
+  while (( i < 28 ));        do bar+="░"; (( i++ )) || true; done
+  printf "\n${_BOLD}${_B}[%2d/%d]${_RST} ${_W}%s${_RST}\n" "${_STEP}" "${_TOTAL}" "$*"
+  printf "       ${_C}%s${_RST} ${_DIM}%3d%%${_RST}\n" "${bar}" "${pct}"
 }
 
-warn() {
-  printf '[WARN] %s\n' "$*"
+spin_run() {
+  local label="$1"; shift
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0
+  "$@" &
+  local pid=$!
+  while kill -0 "${pid}" 2>/dev/null; do
+    printf "\r       ${_C}%s${_RST} ${_DIM}%s...${_RST}  " "${frames[$((i % 10))]}" "${label}"
+    (( i++ )) || true
+    sleep 0.12
+  done
+  wait "${pid}"
+  local rc=$?
+  if (( rc == 0 )); then
+    printf "\r       ${_G}✔${_RST} %-40s\n" "${label}"
+  else
+    printf "\r       ${_R}✘${_RST} %-40s\n" "${label}"
+    return "${rc}"
+  fi
 }
 
-error() {
-  printf '[ERROR] %s\n' "$*" >&2
+banner() {
+  printf "\n"
+  printf "${_B}╔══════════════════════════════════════════╗${_RST}\n"
+  printf "${_B}║${_RST}  ${_BOLD}${_W}HeliProxy${_RST} ${_C}by Klieer${_RST}  ${_DIM}— MTProto Deploy${_RST}    ${_B}║${_RST}\n"
+  printf "${_B}╚══════════════════════════════════════════╝${_RST}\n\n"
 }
 
 has_cmd() {
@@ -73,44 +113,26 @@ apt_install_if_missing() {
   if dpkg -s "${pkg}" >/dev/null 2>&1; then
     return
   fi
-
-  log "Installing missing package: ${pkg}"
+  log "Installing: ${_W}${pkg}${_RST}"
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkg}" >/dev/null 2>&1 || true
 }
 
 ensure_base_tools() {
+  step_start "Installing system packages"
   if has_cmd apt-get; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-    apt_install_if_missing ca-certificates
-    apt_install_if_missing curl
-    apt_install_if_missing git
-    apt_install_if_missing iproute2
-    apt_install_if_missing procps
-    apt_install_if_missing dnsutils
-    apt_install_if_missing nginx
-    apt_install_if_missing nodejs
-    apt_install_if_missing npm
-    apt_install_if_missing certbot
-    apt_install_if_missing python3-certbot-nginx
+    spin_run "apt-get update" bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1"
+    for pkg in ca-certificates curl git iproute2 procps dnsutils nginx nodejs npm certbot python3-certbot-nginx; do
+      apt_install_if_missing "${pkg}"
+    done
   else
     warn "apt-get is not available. Ensure curl/ss/getent/nginx are installed."
   fi
 
-  if ! has_cmd curl; then
-    error "curl is required. Install it and rerun."
-    exit 1
-  fi
-
-  if ! has_cmd ss; then
-    error "ss command is required (iproute2 package). Install it and rerun."
-    exit 1
-  fi
-
-  if ! has_cmd getent; then
-    error "getent command is required. Install libc-bin and rerun."
-    exit 1
-  fi
+  if ! has_cmd curl;   then error "curl is required. Install it and rerun.";   exit 1; fi
+  if ! has_cmd ss;     then error "ss is required (iproute2). Install it and rerun."; exit 1; fi
+  if ! has_cmd getent; then error "getent is required. Install libc-bin and rerun."; exit 1; fi
 }
+
 
 require_value() {
   local key="$1"
@@ -199,7 +221,8 @@ parse_args() {
 }
 
 validate_mask_domain() {
-  log "Validating mask domain for Fake TLS: ${MASK_DOMAIN}"
+  step_start "Validating Fake TLS domain"
+  log "Checking: ${_W}${MASK_DOMAIN}${_RST}"
 
   if ! timeout 5 getent ahostsv4 "${MASK_DOMAIN}" >/dev/null 2>&1; then
     warn "Domain ${MASK_DOMAIN} has no visible IPv4 DNS record from this VPS."
@@ -213,9 +236,7 @@ validate_mask_domain() {
 }
 
 validate_server_host_mapping() {
-  if [[ -z "${SERVER_HOST}" ]]; then
-    return
-  fi
+  if [[ -z "${SERVER_HOST}" ]]; then return; fi
 
   local dns_ip
   dns_ip="$(timeout 5 getent ahostsv4 "${SERVER_HOST}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
@@ -226,28 +247,28 @@ validate_server_host_mapping() {
   fi
 
   if [[ -n "${SERVER_IP}" ]] && [[ "${dns_ip}" != "${SERVER_IP}" ]]; then
-    warn "DNS A record mismatch: ${SERVER_HOST} -> ${dns_ip}, expected ${SERVER_IP}."
+    warn "DNS mismatch: ${SERVER_HOST} → ${dns_ip}, expected ${SERVER_IP}."
   else
-    log "DNS for ${SERVER_HOST} resolves to ${dns_ip}."
+    log "DNS ${_W}${SERVER_HOST}${_RST} → ${_G}${dns_ip}${_RST}"
   fi
 }
 
 apply_network_tuning() {
+  step_start "Applying network tuning (BBR + fq)"
   local sysctl_file="/etc/sysctl.d/99-mtproto-tuning.conf"
-
   cat > "${sysctl_file}" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-
   if sysctl --system >/dev/null 2>&1; then
-    log "Applied network tuning (fq + BBR)."
+    log "Applied: ${_G}fq + BBR${_RST}"
   else
     warn "Could not apply sysctl tuning now. Reboot may be required."
   fi
 }
 
 open_firewall_port_if_possible() {
+  step_start "Opening firewall port ${PORT}/tcp"
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -qi "Status: active"; then
       ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
@@ -269,23 +290,23 @@ open_firewall_port_if_possible() {
 }
 
 install_docker_if_missing() {
+  step_start "Installing Docker"
   if has_cmd docker; then
     log "Docker already installed: $(docker --version)"
     return
   fi
 
-  log "Docker not found. Installing..."
-  curl -fsSL --max-time 60 https://get.docker.com | timeout 300 sh
+  spin_run "Downloading Docker installer" bash -c "curl -fsSL --max-time 60 https://get.docker.com -o /tmp/get-docker.sh"
+  spin_run "Installing Docker" bash -c "timeout 300 sh /tmp/get-docker.sh >/dev/null 2>&1"
   systemctl enable docker --now >/dev/null 2>&1 || true
   log "Docker installed."
 }
 
 pull_mtg_image() {
-  log "Pulling image ${MTG_IMAGE}"
+  step_start "Pulling MTG image"
   local attempt=1
   while (( attempt <= 3 )); do
-    if timeout 120 docker pull "${MTG_IMAGE}" >/dev/null 2>&1; then
-      log "Image pulled successfully."
+    if spin_run "docker pull ${MTG_IMAGE} (attempt ${attempt})" bash -c "timeout 120 docker pull '${MTG_IMAGE}' >/dev/null 2>&1"; then
       return
     fi
     warn "Pull attempt ${attempt} failed, retrying in 3s..."
@@ -297,6 +318,7 @@ pull_mtg_image() {
 }
 
 stop_common_web_services() {
+  step_start "Checking port ${PORT} availability"
   local busy
   busy="$(ss -tulpn 2>/dev/null | grep -E ":${PORT}\\b" || true)"
   if [[ -z "${busy}" ]]; then
@@ -324,20 +346,20 @@ stop_common_web_services() {
 }
 
 generate_secret_if_needed() {
+  step_start "Generating MTProto secret"
   if [[ -n "${SECRET}" ]]; then
     log "Using provided secret."
     return
   fi
 
-  log "Generating Fake TLS secret for domain: ${MASK_DOMAIN}"
+  log "Fake TLS mask: ${_W}${MASK_DOMAIN}${_RST}"
   SECRET="$(timeout 30 docker run --rm "${MTG_IMAGE}" generate-secret --hex "${MASK_DOMAIN}" | tr -d '\r\n')"
 
   if [[ -z "${SECRET}" ]]; then
     error "Failed to generate secret."
     exit 1
   fi
-
-  log "Secret generated."
+  log "Secret generated: ${_DIM}${SECRET:0:16}…${_RST}"
 }
 
 save_env_file() {
@@ -356,32 +378,30 @@ EOF
 }
 
 start_proxy_container() {
+  step_start "Starting MTProto container"
   if docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
     log "Removing existing container: ${CONTAINER_NAME}"
     docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   fi
 
-  log "Starting MTProto container..."
-  docker run -d \
-    --name "${CONTAINER_NAME}" \
-    --restart unless-stopped \
-    --health-cmd "pgrep mtg || exit 1" \
-    --health-interval 30s \
-    --health-retries 3 \
-    --health-timeout 5s \
-    -p "${PORT}:${PORT}" \
-    "${MTG_IMAGE}" \
-    simple-run -n "${DNS_RESOLVER}" -i prefer-ipv4 "0.0.0.0:${PORT}" "${SECRET}" >/dev/null
+  spin_run "Launching ${CONTAINER_NAME}" bash -c "
+    docker run -d \
+      --name '${CONTAINER_NAME}' \
+      --restart unless-stopped \
+      --health-cmd 'pgrep mtg || exit 1' \
+      --health-interval 30s \
+      --health-retries 3 \
+      --health-timeout 5s \
+      -p '${PORT}:${PORT}' \
+      '${MTG_IMAGE}' \
+      simple-run -n '${DNS_RESOLVER}' -i prefer-ipv4 '0.0.0.0:${PORT}' '${SECRET}' >/dev/null
+  "
 
-  local attempts=0
-  local status=""
+  local attempts=0 status=""
   while (( attempts < 10 )); do
     sleep 2
     status="$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
-    if [[ "${status}" == "running" ]]; then
-      log "Container is running."
-      return
-    fi
+    [[ "${status}" == "running" ]] && { log "Container ${_G}running${_RST}."; return; }
     (( attempts++ ))
   done
 
@@ -420,7 +440,7 @@ post_start_self_check() {
     exit 1
   fi
 
-  log "Self-check passed: port ${PORT} is listening."
+  printf "       ${_G}✔${_RST} Self-check passed — port ${_W}${PORT}${_RST} is listening\n"
 }
 
 print_result() {
@@ -435,39 +455,28 @@ print_result() {
 
   if [[ -z "${server_addr}" ]]; then
     warn "Could not detect public IP automatically."
-    warn "Use your VPS public IP in link manually."
     server_addr="<YOUR_SERVER_IP_OR_HOST>"
   fi
 
   tg_link="tg://proxy?server=${server_addr}&port=${PORT}&secret=${SECRET}"
   LAST_TG_LINK="${tg_link}"
 
-  cat <<EOF
-
-========================================
-  HeliProxy by Klieer — MTProto ready.
-
-Container: ${CONTAINER_NAME}
-Port:      ${PORT}
-Domain:    ${MASK_DOMAIN}
-Secret:    ${SECRET}
-
-Telegram link:
-${tg_link}
-
-Web:   https://${SERVER_HOST}
-Monitor: http://127.0.0.1:3000/health
-
-Sponsor channel:
-https://t.me/helitop1337
-
-Quick checks:
-  docker ps
-  docker logs ${CONTAINER_NAME} --tail 20
-  pm2 status
-  pm2 logs heliproxy-monitor
-========================================
-EOF
+  printf "\n"
+  printf "${_G}╔══════════════════════════════════════════╗${_RST}\n"
+  printf "${_G}║${_RST}  ${_BOLD}${_W}HeliProxy by Klieer${_RST} ${_G}— Proxy is LIVE${_RST}     ${_G}║${_RST}\n"
+  printf "${_G}╠══════════════════════════════════════════╣${_RST}\n"
+  printf "${_G}║${_RST}  ${_DIM}Container${_RST}  ${_W}%-30s${_RST}  ${_G}║${_RST}\n" "${CONTAINER_NAME}"
+  printf "${_G}║${_RST}  ${_DIM}Port     ${_RST}  ${_W}%-30s${_RST}  ${_G}║${_RST}\n" "${PORT}"
+  printf "${_G}║${_RST}  ${_DIM}Domain   ${_RST}  ${_W}%-30s${_RST}  ${_G}║${_RST}\n" "${MASK_DOMAIN}"
+  printf "${_G}║${_RST}  ${_DIM}Secret   ${_RST}  ${_C}%-30s${_RST}  ${_G}║${_RST}\n" "${SECRET:0:16}…"
+  printf "${_G}╠══════════════════════════════════════════╣${_RST}\n"
+  printf "${_G}║${_RST}  ${_DIM}Web      ${_RST}  ${_B}https://%-24s${_RST}  ${_G}║${_RST}\n" "${SERVER_HOST}"
+  printf "${_G}║${_RST}  ${_DIM}Health   ${_RST}  ${_B}%-30s${_RST}  ${_G}║${_RST}\n" "http://127.0.0.1:3000/health"
+  printf "${_G}║${_RST}  ${_DIM}Channel  ${_RST}  ${_B}%-30s${_RST}  ${_G}║${_RST}\n" "https://t.me/helitop1337"
+  printf "${_G}╠══════════════════════════════════════════╣${_RST}\n"
+  printf "${_G}║${_RST}  ${_Y}Telegram link:${_RST}                          ${_G}║${_RST}\n"
+  printf "${_G}║${_RST}  ${_C}%s${_RST}\n" "${tg_link}"
+  printf "${_G}╚══════════════════════════════════════════╝${_RST}\n\n"
 }
 
 print_next_steps() {
@@ -488,23 +497,22 @@ EOF
 }
 
 clone_repo() {
+  step_start "Syncing repo from GitHub"
   if [[ -d "${REPO_DIR}/.git" ]]; then
-    log "Updating repo from GitHub..."
-    git -C "${REPO_DIR}" pull --ff-only 2>&1 | while read -r line; do log "${line}"; done
+    spin_run "git pull HeliTop1337/Proxy" bash -c "git -C '${REPO_DIR}' pull --ff-only >/dev/null 2>&1"
   else
-    log "Cloning repo from ${REPO_URL}..."
-    rm -rf "${REPO_DIR}"
-    git clone --depth 1 "${REPO_URL}" "${REPO_DIR}" 2>&1 | while read -r line; do log "${line}"; done
+    spin_run "git clone HeliTop1337/Proxy" bash -c "rm -rf '${REPO_DIR}' && git clone --depth 1 '${REPO_URL}' '${REPO_DIR}' >/dev/null 2>&1"
   fi
 
   if [[ ! -d "${REPO_DIR}" ]]; then
     error "Failed to clone repo."
     exit 1
   fi
-  log "Repo ready at ${REPO_DIR}."
+  log "Repo ready at ${_W}${REPO_DIR}${_RST}."
 }
 
 setup_web_landing() {
+  step_start "Deploying landing page"
   mkdir -p "${WEB_ROOT}"
   cat > "${WEB_ROOT}/index.html" <<'HTMLEOF'
 <!DOCTYPE html>
@@ -552,9 +560,8 @@ HTMLEOF
 }
 
 setup_nginx() {
-  if [[ "${SETUP_NGINX}" != "1" ]]; then
-    return
-  fi
+  if [[ "${SETUP_NGINX}" != "1" ]]; then return; fi
+  step_start "Configuring Nginx"
 
   if ! has_cmd nginx; then
     warn "Nginx not found, skipping Nginx setup."
@@ -583,9 +590,8 @@ setup_nginx() {
 }
 
 setup_monitor() {
-  if [[ "${SETUP_PM2}" != "1" ]]; then
-    return
-  fi
+  if [[ "${SETUP_PM2}" != "1" ]]; then return; fi
+  step_start "Setting up PM2 watchdog"
 
   if ! has_cmd npm; then
     warn "npm not found, skipping PM2/monitor setup."
@@ -618,6 +624,7 @@ setup_monitor() {
 }
 
 main() {
+  banner
   require_root
   parse_args "$@"
   ensure_base_tools
